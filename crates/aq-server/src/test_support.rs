@@ -381,5 +381,24 @@ pub async fn node_busy(
     let internal = |_| crate::error::AppError::Internal;
     let mut tx = state.store.pool.begin().await.map_err(internal)?;
     crate::worker_api::lock_current_node(&mut tx, node).await?;
-    crate::profiled_execution::compute::busy_locked(&mut tx, node.id()).await
+    crate::profiled_execution::compute::busy_locked(
+        &mut tx,
+        node.id(),
+        crate::profiled_execution::compute::Pins::All,
+    )
+    .await
+}
+
+/// A slot poll's `compute::free_locked`, its transaction left open so a test
+/// can probe the row locks and the stop witnesses that poll holds.
+pub async fn slot_poll_open(
+    state: &crate::AppState,
+    node: &crate::worker_api::AuthenticatedNode,
+    slot: u32,
+) -> Result<(sqlx::Transaction<'static, sqlx::Postgres>, bool), crate::error::AppError> {
+    let internal = |_| crate::error::AppError::Internal;
+    let mut tx = state.store.pool.begin().await.map_err(internal)?;
+    crate::worker_api::lock_current_node(&mut tx, node).await?;
+    let free = crate::profiled_execution::compute::free_locked(&mut tx, node.id(), slot).await?;
+    Ok((tx, free))
 }
