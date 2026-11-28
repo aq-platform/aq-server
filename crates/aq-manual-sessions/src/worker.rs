@@ -91,7 +91,8 @@ async fn poll(
         .filter(|s| s.desired_running && s.status == "pending")
         .count();
     let mut scheduler = Scheduler::new(&sessions, slots, &v, desired.as_deref());
-    if let Some(witness) = s.compute_witness {
+    // Only a pending claim writes a slot, the guarded write the witness pins.
+    if let Some(witness) = s.compute_witness.filter(|_| pending_count > 0) {
         witness(&mut tx, node).await?;
     }
     let mut jobs = Vec::new();

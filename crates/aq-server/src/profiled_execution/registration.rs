@@ -246,7 +246,7 @@ async fn register_slots_locked(
             .map_err(|_| AppError::Internal)?;
     let unchanged = registration_unchanged(existing.as_ref(), request, &semantic, &qualification);
     if existing.is_some() && !unchanged {
-        let held = super::compute::busy_locked(tx, auth.id()).await?;
+        let held = super::compute::busy_locked(tx, auth.id(), super::compute::Pins::All).await?;
         if held
             && (slots.is_none()
                 || !aq_machine_control::slots::boot_can_register(tx, auth.id())
