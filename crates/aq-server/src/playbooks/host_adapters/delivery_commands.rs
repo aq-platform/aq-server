@@ -244,7 +244,10 @@ impl Service {
             match self.run_delivery(operation).await {
                 Ok(true) => completed += 1,
                 Err(Error::Overloaded) => return Err(Error::Overloaded),
-                Ok(false) | Err(_) => {}
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::warn!(%operation, ?error, "delivery step failed; retried next pass")
+                }
             }
         }
         Ok(completed)
