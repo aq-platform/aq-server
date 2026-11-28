@@ -454,11 +454,15 @@ pub async fn run_step(
                 {
                     return Ok(Some(Completion::refused("no_branch")));
                 }
-                let report =
-                    crate::retained_publication::validate_target(pool, frozen, target).await?;
+                let report = crate::retained_publication::validate_target(pool, frozen, target)
+                    .await?
+                    .report_id;
                 if crate::retained_publication::dispatched(pool, operation, report).await? {
                     return Ok(Some(
-                        crate::retained_publication::recover_step(db, request).await?,
+                        crate::retained_publication::recover_step(
+                            pool, db, delivery, target, frozen,
+                        )
+                        .await?,
                     ));
                 }
             }
@@ -488,7 +492,12 @@ pub async fn run_step(
                     }
                     step
                 } else if !crate::retained_publication::reserve(pool, frozen, target).await? {
-                    Step::Done(crate::retained_publication::recover_step(db, request).await?)
+                    Step::Done(
+                        crate::retained_publication::recover_step(
+                            pool, db, delivery, target, frozen,
+                        )
+                        .await?,
+                    )
                 } else {
                     delivery
                         .branch_publish(

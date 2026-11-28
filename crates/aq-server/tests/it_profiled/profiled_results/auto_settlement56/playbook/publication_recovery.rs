@@ -10,6 +10,7 @@ struct Journal {
     head: Mutex<Option<String>>,
     reads: AtomicUsize,
     refused: AtomicBool,
+    unavailable: AtomicBool,
 }
 #[async_trait::async_trait]
 impl GitPort for Journal {
@@ -21,6 +22,14 @@ impl GitPort for Journal {
         _: Option<&str>,
         _: &str,
     ) -> std::result::Result<Value, GitFailure> {
+        if self.unavailable.load(Ordering::SeqCst) {
+            return Err(GitFailure {
+                code: "transport".into(),
+                message: "aq-git did not answer".into(),
+                transient: true,
+                details: Value::Null,
+            });
+        }
         if self.refused.load(Ordering::SeqCst) {
             return Ok(
                 json!({"operation_id":original,"generation":7,"status":"complete","phase":"complete","outcome":"rejected","reason":"remote_rejected","rejection_class":"hook_declined","published":false}),
@@ -84,6 +93,19 @@ impl GitPort for Journal {
         panic!("recovery must not release source")
     }
 }
+/// The host retains only a completion its catalog contract accepts; any other
+/// stays running forever.
+fn retainable(step: &aq_delivery::commands::Completion) {
+    let registry = aq_server::playbooks::review_domain::CatalogProfile::Host10.registry();
+    let contract = registry.commands["branch.publish"]
+        .asynchronous
+        .clone()
+        .unwrap();
+    contract
+        .completion
+        .validate(&json!({"outcome": step.outcome, "output": step.output}))
+        .unwrap();
+}
 struct Case {
     env: AutoEnv,
     pool: sqlx::PgPool,
@@ -130,6 +152,7 @@ impl Case {
             head: Mutex::new(Some(id.head.clone())),
             reads: AtomicUsize::new(0),
             refused: AtomicBool::new(false),
+            unavailable: AtomicBool::new(false),
         });
         let delivery = Delivery::new(journal.clone(), Arc::new(aq_delivery::UnconfiguredGitHub));
         let ns = Uuid::new_v4();
@@ -177,6 +200,71 @@ impl Case {
         )
         .await
     }
+    async fn recover_step(&self, frozen: &Value) -> aq_delivery::commands::Completion {
+        let op = Uuid::new_v4();
+        publication::recover_step(
+            &self.pool,
+            &mut self.pool.acquire().await.unwrap(),
+            &self.delivery,
+            &self.target,
+            FrozenCommand::new(op, "branch.publish", frozen),
+        )
+        .await
+        .unwrap()
+    }
+    /// A later delivery run's `branch.publish` for the same result, stepped in a
+    /// transaction that holds the attempt lock as the host's step does.
+    async fn duplicate(&self) -> aq_delivery::commands::Completion {
+        let request = self.request();
+        let duplicate = self.original().await;
+        let mut tx = self.pool.begin().await.unwrap();
+        sqlx::query("SET LOCAL lock_timeout='10s'")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        sqlx::query("SELECT 1 FROM execution_attempts WHERE attempt_id=$1 FOR UPDATE")
+            .bind(self.id.attempt_id)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        let step = aq_delivery::commands::run_step(
+            &self.pool,
+            &mut tx,
+            aq_delivery::commands::DeliveryRuntime {
+                service: Some(&self.delivery),
+                target: Some(&self.target),
+            },
+            FrozenCommand::new(duplicate, "branch.publish", &request),
+            NOW as i64,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        tx.commit().await.unwrap();
+        step
+    }
+    /// The first run's dispatch, as `reserve` commits it before calling Git.
+    async fn dispatch(&self) -> Uuid {
+        let original = self.original().await;
+        let request = self.request();
+        assert!(
+            publication::reserve(
+                &self.pool,
+                FrozenCommand::new(original, "branch.publish", &request),
+                &self.target
+            )
+            .await
+            .unwrap()
+        );
+        original
+    }
+    async fn recoveries(&self) -> Vec<Value> {
+        sqlx::query_scalar("SELECT r.evidence || jsonb_build_object('actor',r.request->'actor_id','journal',q.publisher) FROM retained_publication_recoveries r JOIN retained_publication_recovery_requests q USING(operation_id) WHERE r.report_id=$1 ORDER BY r.recorded_at")
+            .bind(self.id.report_id)
+            .fetch_all(&self.pool)
+            .await
+            .unwrap()
+    }
 }
 #[tokio::test]
 async fn exact_result_refusal_and_uncertain_success_recover_an_idempotent_receipt_without_republication()
@@ -221,10 +309,9 @@ async fn exact_result_refusal_and_uncertain_success_recover_an_idempotent_receip
         .await
         .unwrap()
     );
-    let completion = publication::recover_step(&mut c.pool.acquire().await.unwrap(), &frozen)
-        .await
-        .unwrap();
+    let completion = c.recover_step(&frozen).await;
     assert_eq!(completion.outcome, "published");
+    retainable(&completion);
     assert!(
         c.env.holds_task().await,
         "recovery does not release or accept"
@@ -350,9 +437,7 @@ async fn definitive_rejection_is_evidence_not_permission_to_retry_or_release() {
         "definitive rejection cannot call operation.reconcile"
     );
     let request = c.request();
-    let replay = publication::recover_step(&mut c.pool.acquire().await.unwrap(), &request)
-        .await
-        .unwrap();
+    let replay = c.recover_step(&request).await;
     assert_eq!(replay.outcome, "refused");
     assert!(c.env.holds_task().await);
 }
@@ -416,8 +501,9 @@ async fn committed_dispatch_marker_prevents_repeated_or_substitute_push_after_a_
             .await
             .unwrap()
     );
-    // Simulate a driver restart with a committed dispatch but no completion.
-    // Any publish would panic in Journal's GitPort implementation.
+    // Simulate a driver restart with a committed dispatch but no completion,
+    // and a remote that does not hold the head. Any publish would panic.
+    *c.journal.head.lock().unwrap() = None;
     let mut db = c.pool.acquire().await.unwrap();
     let step = aq_delivery::commands::run_step(
         &c.pool,
@@ -451,7 +537,11 @@ async fn committed_dispatch_marker_prevents_repeated_or_substitute_push_after_a_
     .await
     .unwrap();
     assert_eq!(count, 1);
-    assert_eq!(c.journal.reads.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        c.journal.reads.load(Ordering::SeqCst),
+        1,
+        "only an observation"
+    );
     assert!(c.env.holds_task().await);
 }
 
@@ -530,4 +620,65 @@ async fn a_proven_preflight_refusal_does_not_fence_a_fresh_request_but_a_dispatc
         .unwrap()
     );
     assert!(c.env.holds_task().await);
+}
+
+#[tokio::test]
+async fn a_duplicate_publication_recovers_the_proven_original_head_without_another_push() {
+    let c = Box::pin(Case::new()).await;
+    let original = c.dispatch().await;
+    // Journal's publish_ref panics: any second push fails this test.
+    let step = c.duplicate().await;
+    assert_eq!(step.outcome, "published");
+    retainable(&step);
+    assert_eq!(step.output, json!({"head": c.id.head}));
+    let recoveries = c.recoveries().await;
+    assert_eq!(recoveries.len(), 1);
+    let receipt = &recoveries[0];
+    assert_eq!(receipt["publication"]["operation_id"], json!(original));
+    assert_eq!(receipt["observation"]["state"], "published");
+    assert_eq!(receipt["identity"]["head"], json!(c.id.head));
+    assert_eq!(receipt["actor"], json!(Uuid::nil()), "the host observed it");
+    assert_eq!(receipt["journal"]["generation"], 7);
+    // A later run replays the recorded receipt without reading Git again.
+    assert_eq!(c.duplicate().await.outcome, "published");
+    assert_eq!(c.journal.reads.load(Ordering::SeqCst), 1);
+    assert_eq!(c.recoveries().await.len(), 1);
+    // The owner endpoint still observes under its own ID after the host did.
+    let owner = c.recover(Uuid::new_v4(), original).await.unwrap();
+    assert_eq!(owner["observation"]["state"], "published");
+    assert!(
+        c.env.holds_task().await,
+        "recovery does not release or accept"
+    );
+    assert_eq!(
+        aq_delivery::commands::published_head(&c.pool, c.id.task_id)
+            .await
+            .unwrap(),
+        Some(c.id.head.clone())
+    );
+}
+
+#[tokio::test]
+async fn a_duplicate_without_journal_proof_still_requires_reconciliation_until_proven() {
+    let c = Box::pin(Case::new()).await;
+    c.dispatch().await;
+    c.journal.unavailable.store(true, Ordering::SeqCst);
+    let unavailable = c.duplicate().await;
+    *c.journal.head.lock().unwrap() = Some("b".repeat(40));
+    c.journal.unavailable.store(false, Ordering::SeqCst);
+    let moved = c.duplicate().await;
+    for step in [&unavailable, &moved] {
+        retainable(step);
+        assert_eq!(step.outcome, "refused");
+        assert_eq!(step.output["reason"], "unreachable");
+        assert_eq!(step.diagnostic, Some("reconciliation_required"));
+    }
+    let held = c.recoveries().await;
+    assert_eq!(held.len(), 2, "each observation is recorded");
+    assert_eq!(held[0]["journal"]["state"], "unavailable");
+    assert!(held.iter().all(|r| r["observation"]["state"] == "held"));
+    assert!(c.env.holds_task().await);
+    // A later announcement observes again and heals once the head is proven.
+    *c.journal.head.lock().unwrap() = Some(c.id.head.clone());
+    assert_eq!(c.duplicate().await.outcome, "published");
 }

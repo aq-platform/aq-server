@@ -155,7 +155,7 @@ pub async fn validate_target(
     pool: &PgPool,
     frozen: FrozenCommand<'_>,
     target: &DeliveryTarget,
-) -> Result<Uuid> {
+) -> Result<Identity> {
     let report = frozen.request["result_ready"]["result_id"]
         .as_str()
         .and_then(|s| s.parse::<Uuid>().ok())
@@ -179,7 +179,7 @@ pub async fn validate_target(
             "publication identity or repository binding differs",
         ));
     }
-    Ok(report)
+    Ok(admitted)
 }
 /// Historical requests and committed dispatches both forbid another push.
 pub async fn dispatched(
@@ -205,7 +205,7 @@ pub async fn reserve(
     frozen: FrozenCommand<'_>,
     target: &DeliveryTarget,
 ) -> Result<bool> {
-    let report = validate_target(pool, frozen, target).await?;
+    let report = validate_target(pool, frozen, target).await?.report_id;
     let mut tx = pool.begin().await?;
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1,179))")
         .bind(report.to_string())
@@ -232,6 +232,26 @@ pub async fn reconcile(
     original: Uuid,
     actor: Uuid,
 ) -> Result<Value> {
+    let mut tx = pool.begin().await?;
+    let evidence = observe(
+        pool, &mut tx, delivery, target, identity, operation, original, actor,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(evidence)
+}
+/// `reconcile` in the caller's transaction `db`, which may already hold the attempt lock.
+#[allow(clippy::too_many_arguments)]
+async fn observe(
+    pool: &PgPool,
+    db: &mut PgConnection,
+    delivery: &Delivery,
+    target: &DeliveryTarget,
+    identity: &Identity,
+    operation: Uuid,
+    original: Uuid,
+    actor: Uuid,
+) -> Result<Value> {
     let recorded = self::identity(
         pool,
         identity.project_id,
@@ -249,16 +269,15 @@ pub async fn reconcile(
         ));
     }
     let request = json!({"identity":identity,"target":target,"publication_operation_id":original,"actor_id":actor});
-    let mut tx = pool.begin().await?;
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1,179))")
         .bind(operation.to_string())
-        .execute(&mut *tx)
+        .execute(&mut *db)
         .await?;
     if let Some(row) = sqlx::query(
         "SELECT request,evidence FROM retained_publication_recoveries WHERE operation_id=$1",
     )
     .bind(operation)
-    .fetch_optional(&mut *tx)
+    .fetch_optional(&mut *db)
     .await?
     {
         if row.get::<Value, _>("request") != request {
@@ -275,7 +294,7 @@ pub async fn reconcile(
     )
     .bind(identity.attempt_id)
     .bind(identity.report_id)
-    .fetch_optional(&mut *tx)
+    .fetch_optional(&mut *db)
     .await?;
     if eligible != Some(true) {
         return Err(DeliveryError::InvalidInput(
@@ -283,7 +302,7 @@ pub async fn reconcile(
         ));
     }
     let row = sqlx::query("SELECT request,subject_id,status,output FROM playbook_host_operations WHERE operation_id=$1 AND command_name='branch.publish'")
-        .bind(original).fetch_optional(&mut *tx).await?.ok_or(DeliveryError::InvalidInput("publication not found"))?;
+        .bind(original).fetch_optional(&mut *db).await?.ok_or(DeliveryError::InvalidInput("publication not found"))?;
     let frozen: Value = row.get("request");
     if !identity.matches(&frozen, row.get("subject_id"))
         || !identity.matches_target(&frozen, target)
@@ -296,7 +315,7 @@ pub async fn reconcile(
     // own transaction before the journal-changing reconciliation, even if this
     // transaction later loses its receipt or the process stops.
     let journal = if let Some(row) = sqlx::query("SELECT request,publisher FROM retained_publication_recovery_requests WHERE operation_id=$1")
-        .bind(operation).fetch_optional(&mut *tx).await? {
+        .bind(operation).fetch_optional(&mut *db).await? {
         if row.get::<Value,_>("request") != request { return Err(DeliveryError::IdempotencyConflict); }
         row.get("publisher")
     } else {
@@ -313,30 +332,90 @@ pub async fn reconcile(
         "publisher":journal,
         "observation":observation});
     sqlx::query("INSERT INTO retained_publication_recoveries(operation_id,publication_operation_id,report_id,request,evidence) VALUES($1,$2,$3,$4,$5)")
-        .bind(operation).bind(original).bind(identity.report_id).bind(request).bind(&evidence).execute(&mut *tx).await?;
-    tx.commit().await?;
+        .bind(operation).bind(original).bind(identity.report_id).bind(request).bind(&evidence).execute(&mut *db).await?;
     Ok(evidence)
 }
-/// Duplicate publications may recover an existing receipt, but never send another push.
-pub async fn recover_step(db: &mut PgConnection, request: &Value) -> Result<Completion> {
+/// Duplicate publications recover an existing receipt or observe the original
+/// dispatch's journal exactly as `reconcile` does, but never send another push.
+/// `db` is the step's transaction, which holds the attempt lock.
+pub async fn recover_step(
+    pool: &PgPool,
+    db: &mut PgConnection,
+    delivery: &Delivery,
+    target: &DeliveryTarget,
+    frozen: FrozenCommand<'_>,
+) -> Result<Completion> {
+    let request = frozen.request;
     let report = request["result_ready"]["result_id"]
         .as_str()
         .ok_or(DeliveryError::InvalidInput("result"))?;
     let receipt: Option<Value> = sqlx::query_scalar("SELECT evidence FROM retained_publication_recoveries WHERE report_id::text=$1 AND evidence#>>'{observation,state}'='published' ORDER BY recorded_at LIMIT 1")
-        .bind(report).fetch_optional(db).await?;
+        .bind(report).fetch_optional(&mut *db).await?;
+    let receipt = match receipt {
+        Some(receipt) => Some(receipt),
+        None => observe_dispatch(pool, db, delivery, target, frozen).await?,
+    };
     // Even a previously recovered receipt must still name this exact commit.
     if let Some(receipt) = receipt
+        && receipt["observation"]["state"] == "published"
         && receipt["identity"]["head"] == request["result_head"]
     {
+        // The catalog's `published` output is exactly `{head}`; the receipt stays in its table.
         return Ok(Completion::new(
             "published",
-            json!({"head":request["result_head"],"recovery_operation_id":receipt["operation_id"]}),
+            json!({"head":request["result_head"]}),
         ));
     }
     Ok(Completion {
         diagnostic: Some("reconciliation_required"),
         ..Completion::refused("unreachable")
     })
+}
+/// The host's own observation of the committed dispatch, recorded like an owner's
+/// (actor nil). `None` when no dispatch is recorded or a check refuses it.
+async fn observe_dispatch(
+    pool: &PgPool,
+    db: &mut PgConnection,
+    delivery: &Delivery,
+    target: &DeliveryTarget,
+    frozen: FrozenCommand<'_>,
+) -> Result<Option<Value>> {
+    let identity = validate_target(pool, frozen, target).await?;
+    let original: Option<Uuid> = sqlx::query_scalar(
+        "SELECT operation_id FROM retained_publication_dispatches WHERE report_id=$1",
+    )
+    .bind(identity.report_id)
+    .fetch_optional(&mut *db)
+    .await?;
+    let Some(original) = original else {
+        return Ok(None);
+    };
+    // One recovery ID per duplicate request: its retries replay one observation.
+    let hash = <sha2::Sha256 as sha2::Digest>::digest(
+        [
+            frozen.operation.as_bytes().as_slice(),
+            b"retained_publication.recover",
+        ]
+        .concat(),
+    );
+    let operation =
+        uuid::Builder::from_custom_bytes(hash[..16].try_into().expect("16 bytes")).into_uuid();
+    match observe(
+        pool,
+        db,
+        delivery,
+        target,
+        &identity,
+        operation,
+        original,
+        Uuid::nil(),
+    )
+    .await
+    {
+        Ok(evidence) => Ok(Some(evidence)),
+        Err(DeliveryError::InvalidInput(_) | DeliveryError::IdempotencyConflict) => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
 /// One selected original operation and its publisher journal. An unavailable journal
